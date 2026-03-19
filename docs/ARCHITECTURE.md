@@ -2,21 +2,13 @@
 
 ## Overview
 
-Visual-primary, audio-bonus fingerprinting engine with dynamic late fusion.
+Visual-only fingerprinting engine with two-pass matching.
 
 ```
                      INDEX PIPELINE
                      ==============
 
   Movie file (.mp4)
-       |
-       +---> ffmpeg (audio extraction, mono 11025 Hz)
-       |       |
-       |       +---> STFT spectrogram (1024-sample Hamming window)
-       |       +---> Peak detection (adaptive percentile threshold)
-       |       +---> Constellation map (sparse time-frequency peaks)
-       |       +---> Combinatorial hashing (anchor + target pairs)
-       |       +---> Store: hash_value -> (movie_id, time_offset) in PostgreSQL
        |
        +---> ffmpeg (frame extraction, 2 fps, scaled to 640px max)
                |
@@ -33,29 +25,27 @@ Visual-primary, audio-bonus fingerprinting engine with dynamic late fusion.
                        +---> Store in FAISS IndexFlatIP
 
 
-                     QUERY PIPELINE
-                     ==============
+                     QUERY PIPELINE (Two-Pass)
+                     =========================
 
   Query clip (5-10 seconds)
        |
-       +---> Audio fingerprinting (same pipeline as indexing)
-       |       |
-       |       +---> Hash lookup in PostgreSQL
-       |       +---> Offset voting: db_time - query_time = alignment
-       |       +---> Histogram peak = candidate (movie_id, timestamp)
-       |       +---> Audio score = peak_matches / total_query_hashes
-       |
-       +---> Visual fingerprinting (same pipeline, 4 fps)
+       +---> [Pass 1: Candidate Selection] (4 fps)
        |       |
        |       +---> FAISS top-20 nearest neighbors per frame
-       |       +---> Offset voting (same mechanism)
-       |       +---> Visual score = 0.45*similarity + 0.35*cluster_frac + 0.20*temporal_order
+       |       +---> Rank-weighted, best-per-frame voting
+       |       |       (each frame gives each movie at most 1 vote,
+       |       |        weighted by rank: 1.0, 0.5, 0.25, ...)
+       |       +---> Offset histogram voting (1.5s bins)
+       |       +---> Concentration scoring (peak votes / total votes)
+       |       +---> Temporal order enforcement
+       |       +---> Score = 0.35*sim + 0.30*cluster_quality + 0.15*cluster_frac + 0.20*temporal
        |
-       +---> Dynamic fusion
+       +---> [Pass 2: Verification] (8 fps, only if top-2 are close)
                |
-               +---> If audio & visual agree: 40% audio + 60% visual
-               +---> If they disagree (dub): 10% audio + 90% visual
-               +---> If only one signal: use what's available
+               +---> Re-extract frames at higher FPS
+               +---> Re-score top candidates with same pipeline
+               +---> Verify offset prediction holds with more data
                |
                +---> Return: movie_id, timestamp, confidence
 ```
@@ -153,10 +143,12 @@ The `DatabaseBackend` abstract class allows swapping to any storage:
 | FAISS index size | 97.2 MB |
 | PostgreSQL size | 14.4 MB |
 | **Total storage** | **111.6 MB (~0.27 MB/min)** |
-| Query time (10s clip) | 1.0-1.4s |
-| Query time (5s clip) | ~0.7s |
+| Query time (10s clip, clear winner) | 1.4-2.2s |
+| Query time (10s clip, with verification) | 4.7-7.2s |
 | FAISS search time | 0.03-0.04s |
 | Timestamp accuracy (clean) | < 0.2s delta |
-| Identification accuracy | 7/7 (100%) across clean + phone captures |
-| Confidence (horizontal phone) | 0.808-0.882 |
-| Confidence (vertical phone) | 0.360-0.861 (depends on screen visibility) |
+| Identification accuracy | 6/6 (100%) phone captures + clean extractions |
+| Confidence (horizontal phone) | 0.661-0.861 |
+| Confidence (vertical phone) | 0.306-0.805 |
+| Runner-up ratio (horizontal) | 1.47x - inf (3/3 have no runner-up) |
+| Runner-up ratio (vertical) | 1.03x - 1.30x |
