@@ -40,6 +40,17 @@ def cmd_index(args):
         db.close()
 
 
+def cmd_reset(args):
+    """Reset all indexes and fingerprint data. Movies table is preserved."""
+    db = Database()
+    try:
+        db.reset_indexes()
+        db.save()
+        print("Reset complete. Re-index your movies with: python main.py index --file ... --title ...")
+    finally:
+        db.close()
+
+
 def cmd_query(args):
     _warmup()
     db = Database()
@@ -134,8 +145,10 @@ def main():
     p_test.add_argument("--start", type=float, default=None)
     p_test.add_argument("--duration", type=float, default=10.0)
 
+    sub.add_parser("reset", help="Reset all indexes (re-index movies after)")
+
     args = parser.parse_args()
-    {"index": cmd_index, "query": cmd_query, "test": cmd_test}[args.command](args)
+    {"index": cmd_index, "query": cmd_query, "test": cmd_test, "reset": cmd_reset}[args.command](args)
 
 
 if __name__ == "__main__":

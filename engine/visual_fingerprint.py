@@ -25,6 +25,7 @@ import torch
 from engine.config import (
     CLIP_MODEL_NAME, CLIP_PRETRAINED, CLIP_EMBEDDING_DIM,
     PHASH_SIZE, FRAME_BATCH_SIZE, FRAME_TARGET_SIZE,
+    DEDUP_SIMILARITY_THRESHOLD, SCENE_BOUNDARY_THRESHOLD,
 )
 
 # Module-level CLIP model singleton
@@ -266,3 +267,65 @@ def fingerprint_visual(video_path: str, fps: float,
 
     print(f"  Visual: {total_frames} frames processed (100%)   ")
     return results
+
+
+def deduplicate_keyframes(
+    embeddings: np.ndarray,
+    dedup_threshold: float = DEDUP_SIMILARITY_THRESHOLD,
+    scene_threshold: float = SCENE_BOUNDARY_THRESHOLD,
+    prev_embedding: np.ndarray = None,
+) -> tuple[list[int], list[list[int]], bool]:
+    """
+    Given N L2-normalized embeddings, identify keyframes and scene boundaries.
+
+    Returns:
+    - kept_indices: indices of keyframes to store (deduplicated)
+    - scenes: list of completed scenes (each is a list of original indices)
+    - scene_boundary_at_start: whether a new scene started at the beginning
+      (used for cross-batch scene flushing)
+
+    A frame is skipped if cosine similarity to the last kept frame > dedup_threshold.
+    A new scene starts when similarity drops below scene_threshold.
+    """
+    if len(embeddings) == 0:
+        return [], [], False
+
+    kept = []
+    scenes = []
+    current_scene = []
+    scene_boundary_at_start = False
+
+    # Use prev_embedding from previous batch for continuity
+    last_kept = prev_embedding
+
+    for i in range(len(embeddings)):
+        if last_kept is None:
+            # First frame ever
+            kept.append(i)
+            current_scene.append(i)
+            last_kept = embeddings[i]
+            continue
+
+        sim = float(embeddings[i] @ last_kept)
+
+        if sim > dedup_threshold:
+            # Near-duplicate — skip, but still part of current scene
+            continue
+        elif sim < scene_threshold:
+            # Scene boundary
+            if i == 0:
+                scene_boundary_at_start = True
+            if current_scene:
+                scenes.append(current_scene)
+            current_scene = [i]
+            kept.append(i)
+            last_kept = embeddings[i]
+        else:
+            # Same scene, different enough to keep
+            kept.append(i)
+            current_scene.append(i)
+            last_kept = embeddings[i]
+
+    # Don't append current_scene to scenes — it may continue in next batch
+    # Caller decides when to flush it
+    return kept, scenes, scene_boundary_at_start

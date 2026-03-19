@@ -25,6 +25,7 @@ from engine.config import (
     OFFSET_STDDEV_THRESHOLD, CONFIDENCE_RATIO,
     SIMILARITY_GATE, RANK_WEIGHT_DECAY, MIN_TEMPORAL_ORDER,
     VERIFY_FPS, VERIFY_WINDOW, VERIFY_TOP_N,
+    SCENE_TOP_K, SCENE_CANDIDATE_MOVIES,
 )
 
 
@@ -38,36 +39,44 @@ class MatchResult:
     match_details: dict = field(default_factory=dict)
 
 
-def _offset_histogram(offsets: list[float], bin_width: float) -> tuple[float, int, float]:
+def _offset_histogram(offsets: list[float], bin_width: float,
+                       weights: np.ndarray = None) -> tuple[float, int, float, float]:
     """
-    Build histogram of offsets, find peak bin.
-    Returns (peak_center_sec, count_in_peak_region, stddev).
+    Build weighted histogram of offsets, find peak bin.
+    Returns (peak_center_sec, count_in_peak_region, stddev, peak_weight).
+    When weights are provided, the peak is selected by total weight, not count.
     """
     if not offsets:
-        return 0.0, 0, float("inf")
+        return 0.0, 0, float("inf"), 0.0
 
     offsets = np.array(offsets)
+    if weights is None:
+        weights = np.ones(len(offsets))
+
     min_off, max_off = offsets.min(), offsets.max()
     bins = np.arange(min_off - bin_width, max_off + 2 * bin_width, bin_width)
-    counts, edges = np.histogram(offsets, bins=bins)
 
-    peak_idx = np.argmax(counts)
-    peak_center = (edges[peak_idx] + edges[peak_idx + 1]) / 2.0
+    # Weighted histogram: sum weights per bin instead of counting
+    bin_weights = np.zeros(len(bins) - 1)
+    bin_indices = np.digitize(offsets, bins) - 1
+    for i, bi in enumerate(bin_indices):
+        if 0 <= bi < len(bin_weights):
+            bin_weights[bi] += weights[i]
 
-    # Count peak + neighbors for robustness
-    total_count = counts[peak_idx]
-    if peak_idx > 0:
-        total_count += counts[peak_idx - 1]
-    if peak_idx < len(counts) - 1:
-        total_count += counts[peak_idx + 1]
+    peak_idx = np.argmax(bin_weights)
+    peak_center = (bins[peak_idx] + bins[peak_idx + 1]) / 2.0
 
-    in_peak = offsets[
-        (offsets >= edges[max(0, peak_idx - 1)]) &
-        (offsets < edges[min(len(edges) - 1, peak_idx + 2)])
-    ]
+    # Peak + neighbors
+    lo = max(0, peak_idx - 1)
+    hi = min(len(bins) - 1, peak_idx + 2)
+    in_peak_mask = (offsets >= bins[lo]) & (offsets < bins[hi])
+
+    in_peak = offsets[in_peak_mask]
+    total_count = int(in_peak_mask.sum())
+    peak_weight = float(weights[in_peak_mask].sum())
     stddev = float(np.std(in_peak)) if len(in_peak) > 1 else 0.0
 
-    return float(peak_center), int(total_count), stddev
+    return float(peak_center), total_count, stddev, peak_weight
 
 
 def _temporal_order_score(peak_pairs: list[tuple[int, float]]) -> float:
@@ -84,16 +93,66 @@ def _temporal_order_score(peak_pairs: list[tuple[int, float]]) -> float:
     return in_order / (len(db_times) - 1)
 
 
-def _gather_votes(timestamps, search_results, similarity_gate: float) -> dict:
+def _compute_frame_distinctiveness(search_results) -> dict[int, float]:
     """
-    Collect offset votes from FAISS results with rank-weighted, best-per-frame voting.
+    For each query frame, compute how distinctive it is — i.e., how much
+    its FAISS results favor one movie over others.
 
-    Two key mechanisms to suppress false positives:
-    1. Rank weighting: top-ranked matches get exponentially more weight
-    2. Best-per-frame: each query frame gives each movie at most ONE vote
-       (the highest-ranked match). This prevents a wrong movie from
-       accumulating many low-rank votes that inflate its offset histogram.
+    A distinctive frame has its top matches concentrated in one movie.
+    A generic frame has matches spread equally across many movies.
+
+    Returns: {query_idx: distinctiveness_score} where 0.0 = generic, 1.0 = highly distinctive.
+
+    Method: for each frame, find the best similarity per movie, then measure
+    the gap between the best movie and the second-best movie.
     """
+    distinctiveness = {}
+
+    for q_idx, matches in enumerate(search_results):
+        if not matches:
+            distinctiveness[q_idx] = 0.0
+            continue
+
+        # Best similarity per movie for this frame
+        best_per_movie = {}
+        for movie_id, db_ts, similarity in matches:
+            if movie_id not in best_per_movie or similarity > best_per_movie[movie_id]:
+                best_per_movie[movie_id] = similarity
+
+        if len(best_per_movie) <= 1:
+            distinctiveness[q_idx] = 1.0
+            continue
+
+        # Sort by similarity descending
+        sorted_sims = sorted(best_per_movie.values(), reverse=True)
+        top1 = sorted_sims[0]
+        top2 = sorted_sims[1]
+
+        # Gap between best and second-best movie
+        # Typical range: 0.00 (identical) to 0.05+ (very distinctive)
+        # Normalize: gap of 0.02+ is considered fully distinctive
+        gap = top1 - top2
+        distinctiveness[q_idx] = min(1.0, gap / 0.02)
+
+    return distinctiveness
+
+
+def _gather_votes(timestamps, search_results, similarity_gate: float) -> tuple:
+    """
+    Collect offset votes from FAISS results with distinctiveness-weighted,
+    rank-weighted, best-per-frame voting.
+
+    Three mechanisms to suppress false positives:
+    1. Frame distinctiveness: generic frames (dark scenes, transitions) that
+       match every movie equally get low weight. Distinctive frames that
+       clearly favor one movie get high weight. Self-calibrating — no
+       hardcoded brightness or content thresholds.
+    2. Rank weighting: top-ranked matches get exponentially more weight.
+    3. Best-per-frame: each query frame gives each movie at most ONE vote.
+    """
+    # Compute per-frame distinctiveness from the raw FAISS results
+    distinctiveness = _compute_frame_distinctiveness(search_results)
+
     # First pass: find best (lowest rank) match per (query_frame, movie) pair
     best_per_frame_movie = {}  # (q_idx, movie_id) -> (rank, db_ts, similarity)
     gated_count = 0
@@ -114,87 +173,171 @@ def _gather_votes(timestamps, search_results, similarity_gate: float) -> dict:
 
     for (q_idx, movie_id), (rank, db_ts, similarity) in best_per_frame_movie.items():
         q_ts = timestamps[q_idx]
-        weight = RANK_WEIGHT_DECAY ** rank
+        # Weight = rank decay × frame distinctiveness
+        # Distinctive frames get full weight, generic frames get reduced weight
+        # but not silenced (they still contribute to offset clustering)
+        rank_weight = RANK_WEIGHT_DECAY ** rank
+        frame_dist = distinctiveness.get(q_idx, 0.5)
+        weight = rank_weight * (0.2 + 0.8 * frame_dist)
+
         offset = db_ts - q_ts
         movie_data[movie_id]["offsets"].append(offset)
         movie_data[movie_id]["similarities"].append(similarity)
         movie_data[movie_id]["weights"].append(weight)
         movie_data[movie_id]["query_order"].append((q_idx, db_ts))
 
-    return movie_data, gated_count, total_count
+    n_distinctive = sum(1 for d in distinctiveness.values() if d > 0.5)
+    n_generic = sum(1 for d in distinctiveness.values() if d <= 0.5)
+
+    return movie_data, gated_count, total_count, n_distinctive, n_generic
 
 
-def _score_candidates(movie_data: dict, n_query_frames: int) -> list[dict]:
+def _longest_ordered_subsequence(pairs: list[tuple[int, float]],
+                                   max_db_span: float = None) -> list[tuple[int, float]]:
     """
-    Score candidate movies using rank-weighted offset voting + temporal consistency.
+    Find the longest subsequence of (query_idx, db_time) pairs where both
+    query_idx and db_time are monotonically increasing, AND the total db_time
+    span is bounded (to prevent random matches across a whole movie from
+    forming a spurious long chain).
 
-    Key scoring factors:
-    - mean_sim: how similar are the matched frames (weighted by rank)
-    - cluster_frac: what fraction of query frames have matches at the peak offset
-    - concentration: what fraction of ALL this movie's votes land in the peak
-      (true match = high concentration, false positive = scattered votes)
-    - temporal_consistency: do matched frames preserve playback order
+    max_db_span: if set, the db_time range of the chain must be <= this value.
+    """
+    if len(pairs) <= 1:
+        return pairs
+
+    sorted_pairs = sorted(pairs, key=lambda x: x[0])
+
+    if max_db_span is None:
+        # No constraint — standard LIS
+        db_times = [p[1] for p in sorted_pairs]
+        tails = []
+        indices = []
+        parents = [-1] * len(db_times)
+
+        for i, dt in enumerate(db_times):
+            pos = np.searchsorted(tails, dt, side='left')
+            if pos == len(tails):
+                tails.append(dt)
+                indices.append(i)
+            else:
+                tails[pos] = dt
+                indices[pos] = i
+            if pos > 0:
+                parents[i] = indices[pos - 1]
+
+        result = []
+        idx = indices[len(tails) - 1]
+        while idx >= 0:
+            result.append(sorted_pairs[idx])
+            idx = parents[idx]
+        result.reverse()
+        return result
+
+    # Span-constrained: try each pair as the start of a chain
+    best_chain = []
+    for start_i in range(len(sorted_pairs)):
+        start_db = sorted_pairs[start_i][1]
+        max_db = start_db + max_db_span
+
+        # Filter to pairs within db_time range
+        valid = [(qi, dt) for qi, dt in sorted_pairs[start_i:]
+                 if dt >= start_db and dt <= max_db]
+
+        if len(valid) <= len(best_chain):
+            continue
+
+        # Standard LIS within this window
+        db_times = [p[1] for p in valid]
+        tails = []
+        indices = []
+        parents = [-1] * len(db_times)
+
+        for i, dt in enumerate(db_times):
+            pos = np.searchsorted(tails, dt, side='left')
+            if pos == len(tails):
+                tails.append(dt)
+                indices.append(i)
+            else:
+                tails[pos] = dt
+                indices[pos] = i
+            if pos > 0:
+                parents[i] = indices[pos - 1]
+
+        if len(tails) > len(best_chain):
+            chain = []
+            idx = indices[len(tails) - 1]
+            while idx >= 0:
+                chain.append(valid[idx])
+                idx = parents[idx]
+            chain.reverse()
+            best_chain = chain
+
+    return best_chain
+
+
+def _score_candidates(movie_data: dict, n_query_frames: int,
+                       query_duration: float = 10.0) -> list[dict]:
+    """
+    Score candidate movies using multi-scale offset histogram + temporal order.
+
+    Tries multiple bin widths to find the best cluster for each movie,
+    handling both tight matches (small bins) and dedup-spread matches (larger bins).
     """
     candidates = []
     for movie_id, data in movie_data.items():
         offsets = data["offsets"]
-        peak_sec, peak_count, stddev = _offset_histogram(offsets, OFFSET_BIN_WIDTH)
-
-        if peak_count < MIN_VISUAL_MATCHES:
-            continue
-
-        offset_arr = np.array(offsets)
         sim_arr = np.array(data["similarities"])
         weight_arr = np.array(data["weights"])
-        in_peak_mask = np.abs(offset_arr - peak_sec) < OFFSET_BIN_WIDTH * 2
+        offset_arr = np.array(offsets)
 
-        # Weighted similarity: high-rank matches contribute more
-        peak_weights = weight_arr[in_peak_mask]
-        peak_sims = sim_arr[in_peak_mask]
-        if peak_weights.sum() > 0:
-            mean_sim = float(np.average(peak_sims, weights=peak_weights))
-        else:
-            mean_sim = 0.0
+        # Try multiple bin widths — pick the one that gives the best cluster
+        best_result = None
+        for bin_w in [1.5, 5.0, 15.0]:
+            peak_sec, peak_count, stddev, _ = _offset_histogram(offsets, bin_w)
+            if peak_count < MIN_VISUAL_MATCHES:
+                continue
 
-        # Cluster fraction: what fraction of query frames contributed to peak
-        cluster_frac = min(1.0, peak_count / n_query_frames)
+            in_peak_mask = np.abs(offset_arr - peak_sec) < bin_w * 2
 
-        # Concentration: what fraction of this movie's total votes are in the peak
-        # True match: most votes cluster at one offset -> high concentration
-        # False positive: votes scatter across many offsets -> low concentration
-        # BUT: only meaningful when there are enough total votes (prevents lucky small clusters)
-        concentration = peak_count / len(offsets) if len(offsets) > 0 else 0.0
+            # Weighted similarity: distinctive frames contribute more
+            peak_weights = weight_arr[in_peak_mask]
+            peak_sims = sim_arr[in_peak_mask]
+            if peak_weights.sum() > 0:
+                mean_sim = float(np.average(peak_sims, weights=peak_weights))
+            else:
+                mean_sim = 0.0
 
-        # Temporal order consistency
-        peak_pairs = [(qi, dt) for (qi, dt), m in zip(data["query_order"], in_peak_mask) if m]
-        temporal_consistency = _temporal_order_score(peak_pairs)
+            cluster_frac = min(1.0, peak_count / n_query_frames)
+            concentration = peak_count / len(offsets) if len(offsets) > 0 else 0.0
 
-        # Strict temporal order enforcement: reject candidates with random ordering
-        if temporal_consistency < MIN_TEMPORAL_ORDER and peak_count >= 6:
-            continue
+            # Temporal order of peak matches
+            peak_pairs = [(qi, dt) for (qi, dt), m in zip(data["query_order"], in_peak_mask) if m]
+            temporal_consistency = _temporal_order_score(peak_pairs)
 
-        # Combined scoring:
-        # - cluster_frac: absolute signal strength (how many query frames matched at peak)
-        # - concentration: relative signal quality (what fraction of votes are useful)
-        # - Use geometric mean of cluster_frac and concentration to require BOTH
-        #   a large cluster AND high concentration
-        cluster_quality = (cluster_frac * concentration) ** 0.5
+            # Reject poor temporal order
+            if temporal_consistency < MIN_TEMPORAL_ORDER and peak_count >= 6:
+                continue
 
-        visual_score = (0.35 * mean_sim
-                        + 0.30 * cluster_quality
-                        + 0.15 * cluster_frac
-                        + 0.20 * temporal_consistency)
+            cluster_quality = (cluster_frac * concentration) ** 0.5
+            visual_score = (0.30 * mean_sim
+                            + 0.20 * cluster_quality
+                            + 0.15 * cluster_frac
+                            + 0.35 * temporal_consistency)
 
-        candidates.append({
-            "movie_id": movie_id,
-            "offset_sec": peak_sec,
-            "visual_score": visual_score,
-            "mean_similarity": mean_sim,
-            "cluster_size": peak_count,
-            "concentration": concentration,
-            "temporal_consistency": temporal_consistency,
-            "offset_stddev": stddev,
-        })
+            if best_result is None or visual_score > best_result["visual_score"]:
+                best_result = {
+                    "movie_id": movie_id,
+                    "offset_sec": peak_sec,
+                    "visual_score": visual_score,
+                    "mean_similarity": mean_sim,
+                    "cluster_size": peak_count,
+                    "concentration": concentration,
+                    "temporal_consistency": temporal_consistency,
+                    "offset_stddev": stddev,
+                }
+
+        if best_result:
+            candidates.append(best_result)
 
     candidates.sort(key=lambda c: c["visual_score"], reverse=True)
     return candidates
@@ -203,26 +346,20 @@ def _score_candidates(movie_data: dict, n_query_frames: int) -> list[dict]:
 def _verify_candidate(candidate: dict, query_embeddings: np.ndarray,
                        query_timestamps: list[float], db: Database) -> dict:
     """
-    Two-pass verification: re-check candidate at higher FPS.
-
-    The key insight: more query frames should produce MORE matches at the
-    SAME offset if the match is real. If it's noise, more frames just scatter.
-    We measure this via concentration — fraction of votes in the peak.
+    Two-pass verification: re-check candidate at higher FPS with multi-scale bins.
     """
     movie_id = candidate["movie_id"]
     predicted_offset = candidate["offset_sec"]
 
-    # Search with more neighbors for deeper verification
     search_results = db.search_visual(query_embeddings, VISUAL_TOP_K * 2)
 
-    # Gather votes using best-per-frame for this specific movie
+    # Gather best-per-frame matches for this movie
     all_offsets = []
-    peak_sims = []
-    peak_weights = []
-    peak_pairs = []
+    all_sims = []
+    all_weights = []
+    all_pairs = []
 
     for q_idx, (q_ts, matches) in enumerate(zip(query_timestamps, search_results)):
-        # Find best rank for this movie among all matches
         best_rank = None
         best_match = None
         for rank, (mid, db_ts, similarity) in enumerate(matches):
@@ -237,45 +374,95 @@ def _verify_candidate(candidate: dict, query_embeddings: np.ndarray,
 
         db_ts, similarity = best_match
         offset = db_ts - q_ts
+        weight = RANK_WEIGHT_DECAY ** best_rank
         all_offsets.append(offset)
+        all_sims.append(similarity)
+        all_weights.append(weight)
+        all_pairs.append((q_idx, db_ts))
 
-        # Check if this vote agrees with predicted offset
-        if abs(offset - predicted_offset) < OFFSET_BIN_WIDTH * 3:
-            weight = RANK_WEIGHT_DECAY ** best_rank
-            peak_sims.append(similarity)
-            peak_weights.append(weight)
-            peak_pairs.append((q_idx, db_ts))
-
-    if not peak_sims:
+    if not all_offsets:
         candidate["visual_score"] *= 0.3
         candidate["verified"] = False
         return candidate
 
-    # Concentration: of all frames that matched this movie, how many agree on offset?
-    concentration = len(peak_sims) / len(all_offsets) if all_offsets else 0.0
+    offset_arr = np.array(all_offsets)
+    sim_arr = np.array(all_sims)
+    weight_arr = np.array(all_weights)
 
-    weight_arr = np.array(peak_weights)
-    sim_arr = np.array(peak_sims)
-    verified_sim = float(np.average(sim_arr, weights=weight_arr))
-    verified_temporal = _temporal_order_score(peak_pairs)
-    cluster_frac = min(1.0, len(peak_sims) / len(query_timestamps))
+    # Multi-scale: try bin widths, pick best
+    best_score = 0
+    best_result = None
+    for bin_w in [1.5, 5.0, 15.0]:
+        peak_sec, peak_count, stddev, _ = _offset_histogram(all_offsets, bin_w)
+        if peak_count < 2:
+            continue
 
-    cluster_quality = (cluster_frac * concentration) ** 0.5
+        in_peak = np.abs(offset_arr - peak_sec) < bin_w * 2
+        peak_weights = weight_arr[in_peak]
+        peak_sims = sim_arr[in_peak]
 
-    verified_score = (0.35 * verified_sim
-                      + 0.30 * cluster_quality
-                      + 0.15 * cluster_frac
-                      + 0.20 * verified_temporal)
+        if peak_weights.sum() > 0:
+            verified_sim = float(np.average(peak_sims, weights=peak_weights))
+        else:
+            continue
 
-    # Use the better of original and verified scores
-    candidate["visual_score"] = max(candidate["visual_score"], verified_score)
+        peak_pairs = [(qi, dt) for (qi, dt), m in zip(all_pairs, in_peak) if m]
+        verified_temporal = _temporal_order_score(peak_pairs)
+        cluster_frac = min(1.0, peak_count / len(query_timestamps))
+        concentration = peak_count / len(all_offsets)
+        cluster_quality = (cluster_frac * concentration) ** 0.5
+
+        score = (0.35 * verified_sim + 0.30 * cluster_quality
+                 + 0.15 * cluster_frac + 0.20 * verified_temporal)
+
+        if score > best_score:
+            best_score = score
+            best_result = (verified_sim, verified_temporal, concentration, peak_count)
+
+    if best_result is None:
+        candidate["verified"] = False
+        return candidate
+
+    verified_sim, verified_temporal, concentration, v_matches = best_result
+
+    candidate["visual_score"] = max(candidate["visual_score"], best_score)
     candidate["mean_similarity"] = max(candidate["mean_similarity"], verified_sim)
     candidate["temporal_consistency"] = max(candidate["temporal_consistency"], verified_temporal)
     candidate["concentration"] = max(candidate.get("concentration", 0), concentration)
     candidate["verified"] = True
-    candidate["verified_matches"] = len(peak_sims)
+    candidate["verified_matches"] = v_matches
 
     return candidate
+
+
+def _scene_candidate_movies(query_embeddings: np.ndarray, db, top_k: int, max_movies: int) -> list[int] | None:
+    """
+    Coarse pass: search scene index, return top movie IDs by vote count.
+    Returns None if scene index is empty (fallback to frame-only search).
+    """
+    scene_results = db.search_scenes(query_embeddings, top_k)
+
+    # Check if we got any results
+    if not any(scene_results):
+        return None
+
+    # Count votes per movie
+    movie_votes = defaultdict(float)
+    for matches in scene_results:
+        for movie_id, start, end, similarity in matches:
+            movie_votes[movie_id] += similarity
+
+    # Return top movies by total similarity
+    sorted_movies = sorted(movie_votes.items(), key=lambda x: x[1], reverse=True)
+    return [mid for mid, _ in sorted_movies[:max_movies]]
+
+
+def _filter_to_movies(search_results: list, candidate_movie_ids: set) -> list:
+    """Filter FAISS search results to only include matches from candidate movies."""
+    filtered = []
+    for frame_matches in search_results:
+        filtered.append([m for m in frame_matches if m[0] in candidate_movie_ids])
+    return filtered
 
 
 def match_clip(clip_path: str, db: Database = None) -> MatchResult | None:
@@ -304,17 +491,27 @@ def match_clip(clip_path: str, db: Database = None) -> MatchResult | None:
         timestamps = [ts for ts, _, _ in visual_fps]
         embeddings = np.array([emb for _, _, emb in visual_fps], dtype=np.float32)
 
-        # --- FAISS search ---
+        # --- Scene-level coarse search (if available) ---
+        candidate_movie_ids = _scene_candidate_movies(
+            embeddings, db, SCENE_TOP_K, SCENE_CANDIDATE_MOVIES
+        )
+        if candidate_movie_ids:
+            print(f"  Scene search: narrowed to {len(candidate_movie_ids)} candidate movies")
+
+        # --- FAISS frame-level search ---
         t1 = time.time()
         search_results = db.search_visual(embeddings, VISUAL_TOP_K)
+        if candidate_movie_ids:
+            search_results = _filter_to_movies(search_results, set(candidate_movie_ids))
         print(f"  FAISS search: {time.time()-t1:.2f}s")
 
         # --- Rank-weighted offset voting ---
-        movie_data, gated, total = _gather_votes(timestamps, search_results, SIMILARITY_GATE)
-        print(f"  Votes: {total} total, {gated} gated")
+        movie_data, gated, total, n_distinctive, n_generic = _gather_votes(timestamps, search_results, SIMILARITY_GATE)
+        print(f"  Votes: {total} total | Frames: {n_distinctive} distinctive, {n_generic} generic")
 
         # --- Score candidates ---
-        candidates = _score_candidates(movie_data, len(visual_fps))
+        query_duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 10.0
+        candidates = _score_candidates(movie_data, len(visual_fps), query_duration)
 
         for c in candidates[:3]:
             movie = db.get_movie(c["movie_id"])
@@ -367,14 +564,40 @@ def match_clip(clip_path: str, db: Database = None) -> MatchResult | None:
             print(f"\n[Pass 2: Skipped — clear winner]")
 
         # --- Confidence ---
+        # Scoring (visual_score) ranks candidates. Confidence answers a different
+        # question: "should we trust this result?" — using only signals that are
+        # independent of index density and number of indexed movies.
+        #
+        # Scale-independent signals:
+        # 1. Mean similarity of peak matches (CLIP cosine) — how visually close?
+        # 2. Temporal consistency — do matches preserve playback order?
+        # 3. Peak match ratio — what fraction of query frames found a match
+        #    at the winning offset? Normalized by expected hit rate (index_fps / query_fps)
+        #    so deduplication doesn't artificially lower it.
         best = candidates[0]
         if len(candidates) >= 2:
             ratio = best["visual_score"] / max(candidates[1]["visual_score"], 1e-10)
         else:
             ratio = float("inf")
 
-        confidence = min(1.0, best["visual_score"])
-        if ratio < CONFIDENCE_RATIO:
+        # 1. Similarity quality: CLIP cosine 0.82 = weak, 0.92+ = strong
+        sim_norm = min(1.0, max(0.0, (best["mean_similarity"] - 0.82) / 0.10))
+
+        # 2. Temporal order
+        temporal_conf = best["temporal_consistency"]
+
+        # 3. Match coverage: what fraction of query frames matched at the peak?
+        #    Normalize by expected coverage given index density.
+        #    At 2fps index / 4fps query, we expect ~50% coverage at best.
+        #    With dedup (~60% kept), expect ~30% coverage.
+        #    So 20%+ coverage is good signal.
+        coverage = min(1.0, best["cluster_size"] / max(len(visual_fps) * 0.20, 1))
+
+        confidence = 0.40 * sim_norm + 0.30 * temporal_conf + 0.30 * coverage
+
+        # Only penalize if runner-up is within a tight margin
+        # This is genuinely suspicious regardless of scale
+        if ratio < 1.05:
             confidence *= 0.5
 
         movie = db.get_movie(best["movie_id"])

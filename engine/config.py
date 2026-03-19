@@ -10,7 +10,7 @@ PHASH_SIZE = 8                  # 8x8 DCT -> 64-bit hash
 FRAME_TARGET_SIZE = 224         # All frames normalized to this before CLIP
 
 # --- Matching ---
-OFFSET_BIN_WIDTH = 1.5          # Seconds for offset histogram binning (wider for phone capture timing jitter)
+OFFSET_BIN_WIDTH = 1.5          # Seconds for offset histogram binning
 MIN_VISUAL_MATCHES = 4
 OFFSET_STDDEV_THRESHOLD = 1.5   # Max stddev in winning cluster (sec)
 CONFIDENCE_RATIO = 1.25         # Best must be >= this * second-best
@@ -29,10 +29,20 @@ POSTGRES_DB = os.getenv("POSTGRES_DB", "movie_fp")
 POSTGRES_USER = os.getenv("POSTGRES_USER", "fingerprint")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "fingerprint")
 
+# --- Keyframe deduplication ---
+DEDUP_SIMILARITY_THRESHOLD = 1.0    # 1.0 = no dedup (keep all frames); lower to skip near-duplicates
+SCENE_BOUNDARY_THRESHOLD = 0.90     # Similarity below this starts a new scene
+
 # --- Paths ---
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 FAISS_INDEX_PATH = os.path.join(DATA_DIR, "faiss_visual.index")
 FAISS_ID_MAP_PATH = os.path.join(DATA_DIR, "faiss_id_map.pkl")
+FAISS_SCENE_INDEX_PATH = os.path.join(DATA_DIR, "faiss_scene.index")
+FAISS_SCENE_ID_MAP_PATH = os.path.join(DATA_DIR, "faiss_scene_id_map.pkl")
+
+# --- Scene matching ---
+SCENE_TOP_K = 10                    # Top-K scenes in coarse search
+SCENE_CANDIDATE_MOVIES = 5          # Max movies from scene search to pass to frame search
 
 # --- Frame processing ---
 FRAME_BATCH_SIZE = 120          # Process this many frames at a time
