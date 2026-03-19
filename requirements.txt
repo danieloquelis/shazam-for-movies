@@ -1,0 +1,9 @@
+numpy
+psycopg2-binary
+faiss-cpu
+Pillow
+imagehash
+opencv-python-headless
+torch
+torchvision
+open-clip-torch
