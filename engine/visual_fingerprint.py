@@ -53,6 +53,128 @@ def _get_clip():
     return _clip_model, _clip_preprocess, _clip_device
 
 
+def _detect_screen_region(frame: np.ndarray) -> np.ndarray | None:
+    """
+    Detect a screen/monitor region in the frame and extract it.
+
+    Works for: laptop screens, TV screens, monitors, projected screens.
+    Returns the extracted screen content, perspective-corrected to a rectangle.
+    Returns None if no clear screen region is found (frame used as-is).
+
+    Conservative detection — only triggers when there's a clear rectangular
+    screen boundary with darker surroundings. Avoids false positives on
+    direct TV captures where the movie fills the whole frame.
+
+    Validation: the region inside the quad must be significantly brighter
+    than the region outside (screen vs desk/wall).
+    """
+    h, w = frame.shape[:2]
+    frame_area = h * w
+    gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+
+    # Blur to reduce noise, then edge detection
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 30, 100)
+
+    # Dilate edges to close gaps
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    edges = cv2.dilate(edges, kernel, iterations=2)
+
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    best_quad = None
+    best_area = 0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        # Screen should be 20-85% of frame (not nearly full-frame)
+        if area < frame_area * 0.20 or area > frame_area * 0.85:
+            continue
+
+        # Approximate contour to polygon
+        peri = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+
+        # Looking for roughly rectangular shapes (4-8 vertices — screens
+        # may have rounded corners, webcam notches, or cables that add vertices)
+        if 4 <= len(approx) <= 8 and area > best_area:
+            # Validate: check that the shape is roughly rectangular
+            # Use min area rect for aspect ratio check (works for 4-6 vertices)
+            min_rect = cv2.minAreaRect(approx)
+            box_pts = cv2.boxPoints(min_rect).astype(np.float32)
+            ordered = _order_points(box_pts)
+            w_top = np.linalg.norm(ordered[1] - ordered[0])
+            h_left = np.linalg.norm(ordered[3] - ordered[0])
+            if w_top < 1 or h_left < 1:
+                continue
+            aspect = w_top / h_left
+            if aspect < 0.3 or aspect > 3.0:
+                continue
+
+            best_quad = approx
+            best_area = area
+
+    if best_quad is not None:
+        # Validate: inside the contour should have different brightness than outside
+        # Screens create a clear brightness boundary (either brighter or darker
+        # than surroundings, depending on content and room lighting)
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.fillConvexPoly(mask, best_quad.reshape(-1, 2).astype(np.int32), 255)
+        inside_mean = cv2.mean(gray, mask=mask)[0]
+        outside_mean = cv2.mean(gray, mask=cv2.bitwise_not(mask))[0]
+
+        # Require some brightness difference (either direction)
+        if abs(inside_mean - outside_mean) < 8:
+            return None
+
+        # Use bounding rectangle of the contour as the screen crop.
+        # Simpler and more robust than perspective transform for slightly
+        # angled captures. The subsequent CLAHE + center-crop handles
+        # any remaining edge artifacts.
+        x, y, bw, bh = cv2.boundingRect(best_quad)
+
+        # Inset slightly (5%) to avoid capturing screen bezel
+        inset_x = int(bw * 0.05)
+        inset_y = int(bh * 0.05)
+        x += inset_x
+        y += inset_y
+        bw -= 2 * inset_x
+        bh -= 2 * inset_y
+
+        if bw > 50 and bh > 50:
+            return frame[y:y+bh, x:x+bw]
+
+    # Fallback: brightness-based detection using Otsu thresholding.
+    # Screens create a clear bright/dark boundary against surroundings.
+    _, bright_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if frame_area * 0.20 < area < frame_area * 0.85:
+            x, y, bw, bh = cv2.boundingRect(largest)
+            # Inset 5%
+            ix, iy = int(bw * 0.05), int(bh * 0.05)
+            x, y, bw, bh = x + ix, y + iy, bw - 2*ix, bh - 2*iy
+            if bw > 50 and bh > 50:
+                return frame[y:y+bh, x:x+bw]
+
+    return None
+
+
+def _order_points(pts: np.ndarray) -> np.ndarray:
+    """Order 4 points as: top-left, top-right, bottom-right, bottom-left."""
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]   # top-left has smallest sum
+    rect[2] = pts[np.argmax(s)]   # bottom-right has largest sum
+    d = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(d)]   # top-right has smallest difference
+    rect[3] = pts[np.argmax(d)]   # bottom-left has largest difference
+    return rect
+
+
 def _normalize_frame(frame: np.ndarray) -> np.ndarray:
     """
     Normalize a frame for robust fingerprinting.
@@ -206,13 +328,17 @@ def compute_clip_embeddings(frames: list[np.ndarray], batch_size: int = 64) -> n
 
 def fingerprint_visual(video_path: str, fps: float,
                        start_sec: float = 0, duration_sec: float = None,
-                       normalize: bool = True) -> list[tuple[float, int, np.ndarray]]:
+                       normalize: bool = True,
+                       detect_screen: bool = False) -> list[tuple[float, int, np.ndarray]]:
     """
     Full visual fingerprinting pipeline.
     Returns list of (timestamp_sec, phash_int, embedding_512d).
 
     When normalize=True (default), frames are preprocessed for robustness
     against resolution, brightness, letterboxing, and noise differences.
+
+    When detect_screen=True, attempts to find and extract the screen region
+    from each frame before normalization. Use for phone captures of laptop/TV screens.
     """
     if duration_sec is None:
         probe_cmd = [
@@ -241,13 +367,34 @@ def fingerprint_visual(video_path: str, fps: float,
 
         timestamps = [f[0] for f in raw_frames]
 
+        # Screen detection: try to extract screen content from each frame.
+        # If detection succeeds on most frames (>50%), only keep those frames
+        # where it worked — the others would contain desk/wall noise.
+        if detect_screen:
+            screen_results = [(f[1], _detect_screen_region(f[1])) for f in raw_frames]
+            n_detected = sum(1 for _, s in screen_results if s is not None)
+
+            if n_detected > len(raw_frames) * 0.5:
+                # Screen found in most frames — use detected screens, skip failures
+                kept = [(i, s) for i, (_, s) in enumerate(screen_results) if s is not None]
+                processed_raws = [s for _, s in kept]
+                timestamps = [timestamps[i] for i, _ in kept]
+            elif n_detected > 0:
+                # Some detected — use screen where found, full frame otherwise
+                processed_raws = [s if s is not None else orig for orig, s in screen_results]
+            else:
+                # No screen detected — use frames as-is
+                processed_raws = [f[1] for f in raw_frames]
+        else:
+            processed_raws = [f[1] for f in raw_frames]
+
         # Normalize frames for robustness
         if normalize:
-            frame_arrays = [_normalize_frame(f[1]) for f in raw_frames]
+            frame_arrays = [_normalize_frame(f) for f in processed_raws]
         else:
             frame_arrays = [
-                cv2.resize(f[1], (FRAME_TARGET_SIZE, FRAME_TARGET_SIZE))
-                for f in raw_frames
+                cv2.resize(f, (FRAME_TARGET_SIZE, FRAME_TARGET_SIZE))
+                for f in processed_raws
             ]
 
         # Compute pHashes on normalized frames

@@ -465,10 +465,13 @@ def _filter_to_movies(search_results: list, candidate_movie_ids: set) -> list:
     return filtered
 
 
-def match_clip(clip_path: str, db: Database = None) -> MatchResult | None:
+def match_clip(clip_path: str, db: Database = None, detect_screen: bool = False) -> MatchResult | None:
     """
     Match a short video clip against the indexed database.
     Returns MatchResult or None if no confident match.
+
+    detect_screen: if True, attempt to detect and extract screen region
+    from each frame before matching. Use for captures of laptop/monitor screens.
     """
     own_db = db is None
     if own_db:
@@ -481,8 +484,10 @@ def match_clip(clip_path: str, db: Database = None) -> MatchResult | None:
         # --- Pass 1: Visual fingerprinting ---
         print("\n[Pass 1: Candidate Selection]")
         t1 = time.time()
-        visual_fps = fingerprint_visual(clip_path, fps=VISUAL_QUERY_FPS, normalize=True)
-        print(f"  Query: {len(visual_fps)} frames ({time.time()-t1:.1f}s)")
+        visual_fps = fingerprint_visual(clip_path, fps=VISUAL_QUERY_FPS, normalize=True,
+                                         detect_screen=detect_screen)
+        print(f"  Query: {len(visual_fps)} frames ({time.time()-t1:.1f}s)"
+              + (" [screen detection ON]" if detect_screen else ""))
 
         if not visual_fps:
             print("\nNo frames extracted from clip.")
@@ -537,7 +542,8 @@ def match_clip(clip_path: str, db: Database = None) -> MatchResult | None:
             t1 = time.time()
 
             # Extract higher-FPS embeddings once for all candidates
-            verify_fps_data = fingerprint_visual(clip_path, fps=VERIFY_FPS, normalize=True)
+            verify_fps_data = fingerprint_visual(clip_path, fps=VERIFY_FPS, normalize=True,
+                                                         detect_screen=detect_screen)
             if verify_fps_data:
                 v_timestamps = [ts for ts, _, _ in verify_fps_data]
                 v_embeddings = np.array([emb for _, _, emb in verify_fps_data], dtype=np.float32)

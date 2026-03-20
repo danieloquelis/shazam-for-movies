@@ -55,7 +55,7 @@ def cmd_query(args):
     _warmup()
     db = Database()
     try:
-        result = match_clip(args.file, db=db)
+        result = match_clip(args.file, db=db, detect_screen=args.screen)
         if result is None:
             print("No confident match found.")
             sys.exit(1)
@@ -138,6 +138,8 @@ def main():
 
     p_query = sub.add_parser("query", help="Query a clip")
     p_query.add_argument("--file", required=True)
+    p_query.add_argument("--screen", action="store_true",
+                         help="Enable screen detection (for laptop/monitor captures)")
 
     p_test = sub.add_parser("test", help="End-to-end roundtrip test")
     p_test.add_argument("--file", required=True)
