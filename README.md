@@ -1,4 +1,12 @@
+![Shazam for Movies](.github/assets/portrait.png)
+
 # Shazam for Movies
+
+![Status](https://img.shields.io/badge/status-experimental-orange)
+![License](https://img.shields.io/badge/license-MIT-blue)
+![Python](https://img.shields.io/badge/python-3.11+-blue)
+![PyTorch](https://img.shields.io/badge/PyTorch-EE4C2C?logo=pytorch&logoColor=white)
+![FAISS](https://img.shields.io/badge/FAISS-vector%20search-005571)
 
 > Point your phone at any screen playing a movie. In about a second, get back the title and the exact timestamp of the scene.
 
