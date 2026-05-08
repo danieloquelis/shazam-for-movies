@@ -1,9 +1,21 @@
+# Python
 __pycache__/
 *.pyc
+.venv/
+.pytest_cache/
+
+# Node / JS
+node_modules/
+
+# Project data
 data/
+
+# Local video files (never committed)
 *.mp4
 *.m4v
 *.mov
 *.MOV
+
+# Tooling
 .python-version
 .DS_Store

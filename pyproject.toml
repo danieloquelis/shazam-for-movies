@@ -1,0 +1,46 @@
+[project]
+name = "shazam-for-movies"
+version = "0.1.0"
+description = "Visual fingerprinting engine for movie identification — Shazam for Movies."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Daniel Oquelis" }]
+
+# Engine dependencies — required to index/match.
+dependencies = [
+    "numpy>=1.26,<3",
+    "psycopg2-binary>=2.9,<3",
+    "faiss-cpu>=1.8,<2",
+    "Pillow>=10,<12",
+    "imagehash>=4.3,<5",
+    "opencv-python-headless>=4.10,<5",
+    "torch>=2.2,<3",
+    "torchvision>=0.17,<1",
+    "open-clip-torch>=2.24,<3",
+]
+
+[project.optional-dependencies]
+# `uv pip install -e .[backend]` to also install the FastAPI server deps.
+backend = [
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.32,<1",
+    "python-multipart>=0.0.12,<1",
+]
+
+[project.scripts]
+# Convenience: `shazam-movies index --file ...` after install.
+shazam-movies = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["engine", "backend"]
+# main.py is a top-level module exposing the CLI entry point.
+include = ["main.py"]
+
+[dependency-groups]
+# Tools you'd use locally but never ship. Empty for now — add ruff/pytest here later.
+dev = []
