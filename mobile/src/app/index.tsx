@@ -1,98 +1,263 @@
-import * as Device from 'expo-device';
-import { Platform, StyleSheet } from 'react-native';
-import { SafeAreaView } from 'react-native-safe-area-context';
+import { CameraView, useCameraPermissions, useMicrophonePermissions } from 'expo-camera';
+import { router } from 'expo-router';
+import { StatusBar } from 'expo-status-bar';
+import React from 'react';
+import {
+  ActivityIndicator,
+  Pressable,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from 'react-native';
 
-import { AnimatedIcon } from '@/components/animated-icon';
-import { HintRow } from '@/components/hint-row';
-import { ThemedText } from '@/components/themed-text';
-import { ThemedView } from '@/components/themed-view';
-import { WebBadge } from '@/components/web-badge';
-import { BottomTabInset, MaxContentWidth, Spacing } from '@/constants/theme';
+import { ScanRing } from '@/components/scan-ring';
+import { queryClip } from '@/lib/api';
+import { SCAN_DURATION_SEC } from '@/lib/config';
 
-function getDevMenuHint() {
-  if (Platform.OS === 'web') {
-    return <ThemedText type="small">use browser devtools</ThemedText>;
+type Phase = 'idle' | 'recording' | 'uploading';
+
+export default function ScanScreen() {
+  const [cameraPerm, requestCameraPerm] = useCameraPermissions();
+  // expo-camera requires mic permission to record video, even though we
+  // never read the audio track on the backend.
+  const [micPerm, requestMicPerm] = useMicrophonePermissions();
+
+  const cameraRef = React.useRef<CameraView | null>(null);
+  const stopTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [phase, setPhase] = React.useState<Phase>('idle');
+  const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
+
+  // ---- permissions gate ---------------------------------------------------
+
+  if (!cameraPerm || !micPerm) {
+    // First render before hooks resolve — keep it neutral.
+    return <View style={styles.container} />;
   }
-  if (Device.isDevice) {
+
+  if (!cameraPerm.granted || !micPerm.granted) {
     return (
-      <ThemedText type="small">
-        shake device or press <ThemedText type="code">m</ThemedText> in terminal
-      </ThemedText>
+      <View style={styles.permsContainer}>
+        <StatusBar style="light" />
+        <Text style={styles.permsTitle}>Camera access</Text>
+        <Text style={styles.permsBody}>
+          To identify a movie, the app needs access to the camera (to record a short clip) and the
+          microphone (a system requirement for video capture — audio is not used).
+        </Text>
+        <TouchableOpacity
+          style={styles.permsButton}
+          onPress={async () => {
+            await requestCameraPerm();
+            await requestMicPerm();
+          }}
+        >
+          <Text style={styles.permsButtonText}>Grant access</Text>
+        </TouchableOpacity>
+      </View>
     );
   }
-  const shortcut = Platform.OS === 'android' ? 'cmd+m (or ctrl+m)' : 'cmd+d';
+
+  // ---- scan flow ----------------------------------------------------------
+
+  const startScan = React.useCallback(async () => {
+    if (!cameraRef.current || phase !== 'idle') return;
+    setErrorMsg(null);
+    setPhase('recording');
+
+    // Schedule the auto-stop. Note: recordAsync resolves AFTER stopRecording
+    // is called, with the final video URI.
+    stopTimerRef.current = setTimeout(() => {
+      cameraRef.current?.stopRecording();
+    }, SCAN_DURATION_SEC * 1000);
+
+    try {
+      const recording = await cameraRef.current.recordAsync({
+        // Cap maxDuration as a backstop in case the timer above misfires.
+        maxDuration: SCAN_DURATION_SEC + 2,
+      });
+
+      if (!recording?.uri) {
+        setPhase('idle');
+        setErrorMsg('Recording failed. Try again.');
+        return;
+      }
+
+      setPhase('uploading');
+      const result = await queryClip(recording.uri);
+
+      switch (result.status) {
+        case 'match':
+          router.push({
+            pathname: '/result',
+            params: {
+              title: result.title,
+              timestampHuman: result.timestampHuman,
+              timestampSec: String(result.timestampSec),
+              confidence: String(result.confidence),
+              visualScore: String(result.visualScore),
+            },
+          });
+          break;
+        case 'no_match':
+          router.push({ pathname: '/result', params: { miss: '1' } });
+          break;
+        case 'error':
+          setErrorMsg(result.message);
+          break;
+      }
+    } catch (e) {
+      setErrorMsg(e instanceof Error ? e.message : 'Unknown error');
+    } finally {
+      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+      stopTimerRef.current = null;
+      setPhase('idle');
+    }
+  }, [phase]);
+
+  React.useEffect(() => {
+    return () => {
+      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+    };
+  }, []);
+
   return (
-    <ThemedText type="small">
-      press <ThemedText type="code">{shortcut}</ThemedText>
-    </ThemedText>
-  );
-}
+    <View style={styles.container}>
+      <StatusBar style="light" />
+      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} mode="video" facing="back" />
 
-export default function HomeScreen() {
-  return (
-    <ThemedView style={styles.container}>
-      <SafeAreaView style={styles.safeArea}>
-        <ThemedView style={styles.heroSection}>
-          <AnimatedIcon />
-          <ThemedText type="title" style={styles.title}>
-            Welcome to&nbsp;Expo
-          </ThemedText>
-        </ThemedView>
+      {/* Subtle vignette so the button is always legible */}
+      <View pointerEvents="none" style={styles.vignette} />
 
-        <ThemedText type="code" style={styles.code}>
-          get started
-        </ThemedText>
+      <View style={styles.headerArea}>
+        <Text style={styles.appTitle}>Shazam for Movies</Text>
+        <Text style={styles.hint}>
+          {phase === 'idle' && 'Point at a screen and tap to identify the scene'}
+          {phase === 'recording' && `Hold still — recording ${SCAN_DURATION_SEC}s`}
+          {phase === 'uploading' && 'Matching against the index…'}
+        </Text>
+      </View>
 
-        <ThemedView type="backgroundElement" style={styles.stepContainer}>
-          <HintRow
-            title="Try editing"
-            hint={<ThemedText type="code">src/app/index.tsx</ThemedText>}
+      <View style={styles.buttonArea}>
+        {errorMsg && <Text style={styles.error}>{errorMsg}</Text>}
+
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Start scan"
+          accessibilityState={{ disabled: phase !== 'idle' }}
+          disabled={phase !== 'idle'}
+          onPress={startScan}
+          style={({ pressed }) => [styles.scanWrap, pressed && phase === 'idle' && { opacity: 0.85 }]}
+        >
+          <ScanRing
+            active={phase === 'recording'}
+            durationMs={SCAN_DURATION_SEC * 1000}
+            size={220}
           />
-          <HintRow title="Dev tools" hint={getDevMenuHint()} />
-          <HintRow
-            title="Fresh start"
-            hint={<ThemedText type="code">npm run reset-project</ThemedText>}
-          />
-        </ThemedView>
-
-        {Platform.OS === 'web' && <WebBadge />}
-      </SafeAreaView>
-    </ThemedView>
+          <View style={styles.innerButton}>
+            {phase === 'uploading' ? (
+              <ActivityIndicator color="#000" />
+            ) : (
+              <Text style={styles.innerLabel}>{phase === 'recording' ? 'REC' : 'SCAN'}</Text>
+            )}
+          </View>
+        </Pressable>
+      </View>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    justifyContent: 'center',
-    flexDirection: 'row',
+    backgroundColor: '#000',
   },
-  safeArea: {
-    flex: 1,
-    paddingHorizontal: Spacing.four,
+  vignette: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.18)',
+  },
+  headerArea: {
+    position: 'absolute',
+    top: 64,
+    left: 24,
+    right: 24,
     alignItems: 'center',
-    gap: Spacing.three,
-    paddingBottom: BottomTabInset + Spacing.three,
-    maxWidth: MaxContentWidth,
+    gap: 6,
   },
-  heroSection: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    flex: 1,
-    paddingHorizontal: Spacing.four,
-    gap: Spacing.four,
+  appTitle: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: '600',
+    letterSpacing: 0.5,
   },
-  title: {
+  hint: {
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 14,
     textAlign: 'center',
   },
-  code: {
-    textTransform: 'uppercase',
+  buttonArea: {
+    position: 'absolute',
+    bottom: 80,
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    gap: 16,
   },
-  stepContainer: {
-    gap: Spacing.three,
-    alignSelf: 'stretch',
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.four,
-    borderRadius: Spacing.four,
+  error: {
+    color: '#ff6b6b',
+    fontSize: 13,
+    paddingHorizontal: 24,
+    textAlign: 'center',
+  },
+  scanWrap: {
+    width: 240,
+    height: 240,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  innerButton: {
+    position: 'absolute',
+    width: 160,
+    height: 160,
+    borderRadius: 80,
+    backgroundColor: '#fff',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  innerLabel: {
+    color: '#000',
+    fontSize: 22,
+    fontWeight: '700',
+    letterSpacing: 1,
+  },
+  permsContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+    padding: 32,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: 16,
+  },
+  permsTitle: {
+    color: '#fff',
+    fontSize: 22,
+    fontWeight: '600',
+  },
+  permsBody: {
+    color: 'rgba(255,255,255,0.75)',
+    fontSize: 15,
+    textAlign: 'center',
+    lineHeight: 22,
+  },
+  permsButton: {
+    marginTop: 12,
+    backgroundColor: '#fff',
+    paddingHorizontal: 28,
+    paddingVertical: 14,
+    borderRadius: 999,
+  },
+  permsButtonText: {
+    color: '#000',
+    fontWeight: '600',
+    fontSize: 16,
   },
 });

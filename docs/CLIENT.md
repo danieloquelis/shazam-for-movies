@@ -254,8 +254,9 @@ Revised on 2026-05-08 after surveying the existing matcher. The original plan st
 
 1. ✅ **Validation backend** — `backend/` FastAPI service with `GET /healthz` and `POST /query` (multipart video upload, `x-api-key` header, 20 MB cap). Wraps `match_clip` directly. Runs in Docker via the multi-stage `backend/Dockerfile` and the top-level `docker-compose.yml`.
 2. ✅ **Smoke-tested end-to-end** — Harry Potter and X-Men test clips both match through the API with identical results to the CLI. See `docs/CHANGELOG.md` v0.6.
-3. ⏳ **Mobile: camera scan (record-and-upload)** — `expo-camera` records a fixed 5-second clip, uploads as multipart, displays the result.
-4. ⏳ **End-to-end device test** — dev client build, real device, real screen.
+3. ✅ **Mobile: camera scan (record-and-upload)** — `mobile/src/app/index.tsx` uses `expo-camera` to record a fixed 5-second clip, uploads as multipart to `/query`, and pushes a result modal. Backend URL + API key are env-driven via `app.config.ts` and `.env`.
+4. ✅ **Mobile: result screen** — `mobile/src/app/result.tsx` displays title + timestamp + confidence pill, with a "no confident match" branch.
+5. ⏳ **End-to-end device test** — dev client build, real device, real screen.
 
 ### Phase 2 — Streaming (deferred)
 
