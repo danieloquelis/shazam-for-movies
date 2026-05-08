@@ -1,6 +1,53 @@
 # Changelog
 
-## MVP v0.4 — Runner-Up Suppression (Current)
+## v0.6 — HTTP Backend + uv Migration (Current)
+
+**Date:** 2026-05-08
+
+Phase 1 of the client architecture (see `docs/CLIENT.md`). The engine is now reachable over HTTP and ready for a mobile client.
+
+### What changed
+
+1. **`backend/` FastAPI service** — single-file `backend/main.py` exposing two endpoints:
+   - `GET /healthz` — liveness probe
+   - `POST /query` — multipart video upload (max 20 MB), `x-api-key` header, returns `{movie_id, title, timestamp_sec, timestamp_human, confidence, visual_score, match_details}`
+   The service imports `engine.matcher.match_clip` directly. Same code path as the CLI — no behavior changes to the matcher.
+
+2. **`pyproject.toml` + `uv.lock`** — single source of truth for Python dependencies. The two `requirements.txt` files were deleted. Engine deps in `[project.dependencies]`, FastAPI deps in `[project.optional-dependencies.backend]`. `uv sync --frozen` reproduces the env in seconds.
+
+3. **Multi-stage Dockerfile (`backend/Dockerfile`)** — build context is the repo root so the image can see both `engine/` and `pyproject.toml`. Uses `uv` with a cache mount for fast rebuilds. Runtime stage is `python:3.11-slim` + ffmpeg + the resolved `.venv`.
+
+4. **`docker-compose.yml` updated** — adds the `backend` service alongside Postgres. Mounts `./data` so the FAISS indexes built by the CLI are visible to the container; named volume `clip_cache` so the CLIP model weights only download once.
+
+### Verified end-to-end
+
+```
+docker compose up --build -d
+curl -fsS http://localhost:8000/healthz             # {"ok":true,"db_ready":true}
+
+curl -X POST http://localhost:8000/query \
+  -H "x-api-key: dev-key-change-me" \
+  -F "file=@test1-horizontal.mov"
+# → Harry Potter and the Goblet of Fire @ 00:07:12, conf 0.50
+
+curl -X POST http://localhost:8000/query \
+  -H "x-api-key: dev-key-change-me" \
+  -F "file=@test2-horizontal.MOV"
+# → X-Men: Days of Future Past @ 00:54:39.75, conf 0.92, ratio 1.26x
+```
+
+Results match the v0.4 CLI baseline. Auth correctly returns `401` on missing/invalid API keys.
+
+### Notes
+
+- **Local Docker performance is misleading.** First request takes ~12s on macOS because PyTorch runs under amd64 emulation. On Fly.io's native Linux VMs, queries complete in ~1.5–2s as in the CLI.
+- **Streaming endpoints are deferred to Phase 2.** Adding `StreamingMatcher` to the engine without a regression suite was judged risky; we ship record-and-upload first and use it as the parity baseline for the streaming refactor.
+
+---
+
+## MVP v0.4 — Runner-Up Suppression
+
+
 
 **Date:** 2026-03-19
 

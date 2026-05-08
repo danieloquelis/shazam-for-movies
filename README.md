@@ -112,7 +112,8 @@ Vertical, partial-screen phone captures are the genuinely hard case — the engi
 
 ### Requirements
 
-- Python 3.11+ (managed via [pyenv](https://github.com/pyenv/pyenv))
+- Python 3.11 (managed via [pyenv](https://github.com/pyenv/pyenv))
+- [uv](https://docs.astral.sh/uv/) (`brew install uv`)
 - FFmpeg
 - Docker (for the bundled PostgreSQL container)
 
@@ -121,8 +122,9 @@ Vertical, partial-screen phone captures are the genuinely hard case — the engi
 ```bash
 pyenv virtualenv 3.11.6 movie_fingerprint
 pyenv local movie_fingerprint
-pip install -r requirements.txt
-docker compose up -d
+uv sync                              # engine only
+# or: uv sync --extra backend       # engine + FastAPI server
+docker compose up -d postgres
 ```
 
 ### Index a movie
@@ -148,27 +150,47 @@ python main.py test --file movie.mp4 --title "Movie Name" --duration 10
 
 A more detailed setup walkthrough lives in [`docs/SETUP.md`](docs/SETUP.md).
 
+### Run as an HTTP service
+
+The same engine is also available as a FastAPI service for use by clients (e.g. the mobile app in [`mobile/`](mobile/)).
+
+```bash
+docker compose up --build              # postgres + backend on http://localhost:8000
+
+curl -X POST http://localhost:8000/query \
+  -H "x-api-key: dev-key-change-me" \
+  -F "file=@clip.mov"
+```
+
+See [`backend/README.md`](backend/README.md) for the endpoint contract and [`docs/CLIENT.md`](docs/CLIENT.md) for the architectural plan covering the mobile client and future streaming/screen-capture phases.
+
 ---
 
 ## Repository layout
 
 ```
 shazam-for-movies/
+├── pyproject.toml           # Python deps (uv-managed) — single source of truth
+├── uv.lock                  # locked transitive deps
 ├── main.py                  # CLI entry: index / query / test / reset
-├── engine/
+├── engine/                  # indexing + matching library
 │   ├── visual_fingerprint.py  # Frame extraction, normalization, CLIP embedding
 │   ├── indexer.py             # Offline indexing pipeline
 │   ├── matcher.py             # Two-pass query pipeline & offset voting
 │   ├── db.py                  # PostgreSQL + FAISS storage layer
 │   └── config.py              # All tunable parameters
+├── backend/                 # FastAPI service exposing the engine over HTTP
+│   ├── main.py                # /healthz + /query endpoints
+│   └── Dockerfile             # multi-stage build with uv
+├── mobile/                  # Expo / React Native app (separate Node project)
 ├── docs/
 │   ├── IDEATION.md          # Original design rationale
 │   ├── ARCHITECTURE.md      # Detailed system diagrams
 │   ├── RESEARCH.md          # Survey of fingerprinting literature
+│   ├── CLIENT.md            # Mobile + backend architectural plan
 │   ├── CHANGELOG.md         # Version-by-version evolution
 │   └── SETUP.md             # Setup walkthrough
-├── docker-compose.yml       # PostgreSQL container
-└── requirements.txt
+└── docker-compose.yml       # postgres + backend services
 ```
 
 ---

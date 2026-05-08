@@ -9,6 +9,36 @@ services:
       - "5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fingerprint -d movie_fp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      API_KEY: ${API_KEY:-dev-key-change-me}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-20971520}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: movie_fp
+      POSTGRES_USER: fingerprint
+      POSTGRES_PASSWORD: fingerprint
+      CLIP_DEVICE: cpu
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist the FAISS indexes the indexer wrote on the host
+      - ./data:/app/data
+      # Cache CLIP model weights so they only download once
+      - clip_cache:/root/.cache
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   pgdata:
+  clip_cache:
