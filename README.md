@@ -193,6 +193,10 @@ shazam-for-movies/
 └── docker-compose.yml       # postgres + backend services
 ```
 
+For the **storage model** (why both PostgreSQL and FAISS), the **backend
+request lifecycle**, and the **deployment shape**, see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ---
 
 ## How it differs from Shazam (audio)
