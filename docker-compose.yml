@@ -21,7 +21,8 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       API_KEY: ${API_KEY:-dev-key-change-me}
-      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-20971520}
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-41943040}
+      DEBUG_KEEP_UPLOADS: ${DEBUG_KEEP_UPLOADS:-}
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: movie_fp

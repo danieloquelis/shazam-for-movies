@@ -15,8 +15,12 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 import logging
+import math
+import shutil
 import tempfile
+import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +38,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 API_KEY = os.environ.get("API_KEY", "dev-key-change-me")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))  # 20 MB
 ALLOWED_CONTENT_TYPES = {"video/mp4", "video/quicktime", "video/x-m4v", "application/octet-stream"}
+
+# When set (any truthy string), every successful upload is also copied to
+# /app/data/debug-uploads/ before being deleted. The data/ dir is mounted from
+# the host, so the saved clip is inspectable from the Mac. Off by default.
+DEBUG_KEEP_UPLOADS = os.environ.get("DEBUG_KEEP_UPLOADS", "").lower() in {"1", "true", "yes", "on"}
+DEBUG_UPLOADS_DIR = Path("/app/data/debug-uploads")
 
 
 _db: DatabaseBackend | None = None
@@ -79,16 +89,35 @@ def _format_timestamp(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:05.2f}"
 
 
+def _json_safe(value):
+    """Recursively coerce NaN/inf to None so the response is valid JSON.
+
+    The matcher uses float('inf') as a sentinel for "no runner-up", which is
+    fine internally but blows up json.dumps. Sanitize at the response edge.
+    """
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def _serialize(result: MatchResult) -> dict:
-    return {
-        "movie_id": result.movie_id,
-        "title": result.movie_title,
-        "timestamp_sec": result.timestamp_sec,
-        "timestamp_human": _format_timestamp(result.timestamp_sec),
-        "confidence": result.confidence,
-        "visual_score": result.visual_score,
-        "match_details": result.match_details,
-    }
+    return _json_safe(
+        {
+            "movie_id": result.movie_id,
+            "title": result.movie_title,
+            "timestamp_sec": result.timestamp_sec,
+            "timestamp_human": _format_timestamp(result.timestamp_sec),
+            "confidence": result.confidence,
+            "visual_score": result.visual_score,
+            "match_details": result.match_details,
+        }
+    )
 
 
 @app.get("/healthz")
@@ -99,7 +128,10 @@ async def healthz() -> dict:
 @app.post("/query", dependencies=[Depends(require_api_key)])
 async def query(
     file: UploadFile = File(...),
-    detect_screen: bool = False,
+    # Default ON: every request is a phone capture of a screen, so screen
+    # detection helps far more often than it hurts. Override per-request
+    # via ?detect_screen=false if needed.
+    detect_screen: bool = True,
 ) -> JSONResponse:
     if file.content_type and file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -134,6 +166,17 @@ async def query(
             raise HTTPException(status_code=503, detail="db_not_ready")
 
         logger.info("Matching clip (%d bytes, screen=%s)", bytes_written, detect_screen)
+
+        if DEBUG_KEEP_UPLOADS:
+            try:
+                DEBUG_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+                ts = time.strftime("%Y%m%d-%H%M%S")
+                dest = DEBUG_UPLOADS_DIR / f"upload-{ts}{suffix}"
+                shutil.copyfile(tmp_path, dest)
+                logger.info("DEBUG: saved upload to %s", dest)
+            except Exception as e:  # noqa: BLE001 — debug path; never fail the request
+                logger.warning("DEBUG: could not save upload: %s", e)
+
         result = match_clip(tmp_path, db=_db, detect_screen=detect_screen)
 
         if result is None:
