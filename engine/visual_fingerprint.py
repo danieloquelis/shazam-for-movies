@@ -236,9 +236,15 @@ def extract_frames_raw(video_path: str, fps: float,
                        start_sec: float = 0, duration_sec: float = None) -> list[tuple[float, np.ndarray]]:
     """
     Extract raw frames from video at given FPS using ffmpeg.
-    Returns frames at their original resolution (no resizing here — normalization happens later).
+
+    We trust the recorded pixels and ignore any rotation metadata. iOS in
+    particular writes a rotation tag based on the locked UI orientation at the
+    moment of recording, NOT the physical orientation of the phone, so the tag
+    is unreliable for camera apps that lock orientation. Stripping rotation
+    altogether is more robust than trying to honor it: the downstream pipeline
+    (letterbox crop, center crop, screen detection, CLAHE) handles content of
+    any orientation as long as it sees the actual pixels.
     """
-    # Get video dimensions
     probe_cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -250,8 +256,8 @@ def extract_frames_raw(video_path: str, fps: float,
     parts = [p for p in probe.stdout.strip().split(",") if p]
     w, h = int(parts[0]), int(parts[1])
 
-    # Scale down large videos for faster extraction (keep aspect ratio)
-    # Max dimension 640 — enough detail for embeddings, fast to decode
+    # Scale down large videos for faster extraction (keep aspect ratio).
+    # Max dimension 640 — enough detail for embeddings, fast to decode.
     max_dim = 640
     if max(w, h) > max_dim:
         if w > h:
@@ -268,10 +274,15 @@ def extract_frames_raw(video_path: str, fps: float,
         new_w, new_h = w, h
         scale_filter = ""
 
-    cmd = ["ffmpeg"]
+    cmd = [
+        "ffmpeg",
+    ]
     if start_sec > 0:
         cmd += ["-ss", str(start_sec)]
-    cmd += ["-i", video_path]
+    # `-noautorotate` is critical: it tells ffmpeg to ignore the rotation
+    # tag and emit pixels exactly as stored. Without it, modern ffmpeg builds
+    # auto-apply the (often-wrong) rotation tag.
+    cmd += ["-noautorotate", "-i", video_path]
     if duration_sec is not None:
         cmd += ["-t", str(duration_sec)]
     cmd += [

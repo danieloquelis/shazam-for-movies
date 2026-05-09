@@ -601,10 +601,13 @@ def match_clip(clip_path: str, db: Database = None, detect_screen: bool = False)
 
         confidence = 0.40 * sim_norm + 0.30 * temporal_conf + 0.30 * coverage
 
-        # Only penalize if runner-up is within a tight margin
-        # This is genuinely suspicious regardless of scale
-        if ratio < 1.05:
-            confidence *= 0.5
+        # Smooth runner-up penalty.
+        # The old "if ratio < 1.05: halve" cliff let ratio=1.11 publish as 100%,
+        # which lied to users when the top two candidates were essentially tied.
+        # Now: ratio 1.0 → factor 0.0 (full halving), ratio 1.5 → factor ~1.0
+        # (no penalty). Linear in between.
+        ratio_factor = max(0.0, min(1.0, (ratio - 1.0) / 0.5))
+        confidence *= 0.5 + 0.5 * ratio_factor
 
         movie = db.get_movie(best["movie_id"])
         title = movie["title"] if movie else "Unknown"
