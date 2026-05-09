@@ -14,6 +14,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
   scheme: 'whomie',
   userInterfaceStyle: 'automatic',
   ios: {
+    bundleIdentifier: 'com.danieloquelis.whomie',
     icon: './assets/expo.icon',
     infoPlist: {
       NSCameraUsageDescription:
@@ -25,6 +26,7 @@ export default ({ config }: ConfigContext): ExpoConfig => ({
     },
   },
   android: {
+    package: 'com.danieloquelis.whomie',
     adaptiveIcon: {
       backgroundColor: '#000000',
       foregroundImage: './assets/images/android-icon-foreground.png',

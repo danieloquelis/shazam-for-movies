@@ -18,9 +18,10 @@ import { SCAN_DURATION_SEC } from '@/lib/config';
 type Phase = 'idle' | 'recording' | 'uploading';
 
 export default function ScanScreen() {
+  // ---- hooks (must always run, in the same order) -------------------------
   const [cameraPerm, requestCameraPerm] = useCameraPermissions();
-  // expo-camera requires mic permission to record video, even though we
-  // never read the audio track on the backend.
+  // expo-camera requires mic permission to record video, even though the
+  // backend never reads the audio track.
   const [micPerm, requestMicPerm] = useMicrophonePermissions();
 
   const cameraRef = React.useRef<CameraView | null>(null);
@@ -28,43 +29,12 @@ export default function ScanScreen() {
   const [phase, setPhase] = React.useState<Phase>('idle');
   const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
 
-  // ---- permissions gate ---------------------------------------------------
-
-  if (!cameraPerm || !micPerm) {
-    // First render before hooks resolve — keep it neutral.
-    return <View style={styles.container} />;
-  }
-
-  if (!cameraPerm.granted || !micPerm.granted) {
-    return (
-      <View style={styles.permsContainer}>
-        <StatusBar style="light" />
-        <Text style={styles.permsTitle}>Camera access</Text>
-        <Text style={styles.permsBody}>
-          To identify a movie, the app needs access to the camera (to record a short clip) and the
-          microphone (a system requirement for video capture — audio is not used).
-        </Text>
-        <TouchableOpacity
-          style={styles.permsButton}
-          onPress={async () => {
-            await requestCameraPerm();
-            await requestMicPerm();
-          }}
-        >
-          <Text style={styles.permsButtonText}>Grant access</Text>
-        </TouchableOpacity>
-      </View>
-    );
-  }
-
-  // ---- scan flow ----------------------------------------------------------
-
   const startScan = React.useCallback(async () => {
     if (!cameraRef.current || phase !== 'idle') return;
     setErrorMsg(null);
     setPhase('recording');
 
-    // Schedule the auto-stop. Note: recordAsync resolves AFTER stopRecording
+    // Schedule the auto-stop. recordAsync resolves AFTER stopRecording
     // is called, with the final video URI.
     stopTimerRef.current = setTimeout(() => {
       cameraRef.current?.stopRecording();
@@ -72,7 +42,7 @@ export default function ScanScreen() {
 
     try {
       const recording = await cameraRef.current.recordAsync({
-        // Cap maxDuration as a backstop in case the timer above misfires.
+        // Backstop in case the timer above misfires.
         maxDuration: SCAN_DURATION_SEC + 2,
       });
 
@@ -119,6 +89,35 @@ export default function ScanScreen() {
       if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
     };
   }, []);
+
+  // ---- single render decision (after every hook has been called) ---------
+
+  if (!cameraPerm || !micPerm) {
+    // Hooks haven't resolved yet on first render — keep it neutral.
+    return <View style={styles.container} />;
+  }
+
+  if (!cameraPerm.granted || !micPerm.granted) {
+    return (
+      <View style={styles.permsContainer}>
+        <StatusBar style="light" />
+        <Text style={styles.permsTitle}>Camera access</Text>
+        <Text style={styles.permsBody}>
+          To identify a movie, the app needs access to the camera (to record a short clip) and the
+          microphone (a system requirement for video capture — audio is not used).
+        </Text>
+        <TouchableOpacity
+          style={styles.permsButton}
+          onPress={async () => {
+            await requestCameraPerm();
+            await requestMicPerm();
+          }}
+        >
+          <Text style={styles.permsButtonText}>Grant access</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>

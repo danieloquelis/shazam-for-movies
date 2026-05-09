@@ -20,6 +20,6 @@ export const API_KEY = extra.apiKey ?? 'dev-key-change-me';
 
 /**
  * Length of each scan recording, in seconds. The matcher gets best results
- * with 5–10 s of footage.
+ * with 5–10 s of footage; 10s gives roughly 2× the frames to vote with.
  */
-export const SCAN_DURATION_SEC = 5;
+export const SCAN_DURATION_SEC = 10;
